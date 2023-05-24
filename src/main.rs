@@ -2,6 +2,7 @@ use clap::{App, Arg};
 use hyper::service::{make_service_fn, service_fn};
 use hyper::{Body, Request, Response, Server, StatusCode};
 use std::convert::Infallible;
+use std::future::Future;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::{env, fs};
@@ -30,6 +31,17 @@ async fn handle(req: Request<Body>, base_path: PathBuf) -> Result<Response<Body>
     };
 
     Ok(response)
+}
+
+fn make_hyper_server(
+    base_path: PathBuf,
+    addr: SocketAddr,
+) -> impl Future<Output = Result<(), hyper::Error>> {
+    let make_service = make_service_fn(move |_conn| {
+        let base_path = base_path.clone();
+        async move { Ok::<_, Infallible>(service_fn(move |req| handle(req, base_path.clone()))) }
+    });
+    Server::bind(&addr).serve(make_service)
 }
 
 #[tokio::main]
@@ -62,15 +74,70 @@ async fn main() {
     let base_path = env::current_dir().unwrap().join(directory);
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
 
-    let make_service = make_service_fn(move |_conn| {
-        let base_path = base_path.clone();
-        async move { Ok::<_, Infallible>(service_fn(move |req| handle(req, base_path.clone()))) }
-    });
-    let server = Server::bind(&addr).serve(make_service);
+    let server = make_hyper_server(base_path, addr);
 
     println!("Listening on http://{}", addr);
 
     if let Err(e) = server.await {
         eprintln!("Server error: {}", e);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hyper::Client;
+    use hyper::Uri;
+    use lazy_static::lazy_static;
+    use std::net::TcpListener;
+
+    lazy_static! {
+        static ref TEST_SERVER: SocketAddr = setup_server().expect("Failed to start server");
+    }
+
+    // Helper function to find an available port
+    fn find_available_port() -> Result<u16, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(TcpListener::bind("127.0.0.1:0")?.local_addr()?.port())
+    }
+
+    fn setup_server() -> Result<SocketAddr, Box<dyn std::error::Error + Send + Sync>> {
+        let port = find_available_port()?;
+        let addr = SocketAddr::from(([127, 0, 0, 1], port));
+        let base_path = env::current_dir()?;
+        let server = make_hyper_server(base_path, addr);
+        tokio::spawn(server);
+        Ok(addr)
+    }
+
+    #[tokio::test]
+    async fn test_fetch_existing_file() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let client = Client::new();
+        // Test a file that exists
+        let uri = format!(
+            "http://{}:{}/Cargo.toml",
+            TEST_SERVER.ip(),
+            TEST_SERVER.port()
+        )
+        .parse::<Uri>()?;
+        let response = client.get(uri).await?;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_fetch_unexisting_file() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let client = Client::new();
+        // Test a file that does not exist
+        let uri = format!(
+            "http://{}:{}/does_not_exist.txt",
+            TEST_SERVER.ip(),
+            TEST_SERVER.port()
+        )
+        .parse::<Uri>()?;
+        let response = client.get(uri).await?;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        Ok(())
     }
 }
