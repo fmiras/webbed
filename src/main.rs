@@ -7,13 +7,65 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::{env, fs};
 
+async fn generate_directory_listing(path: PathBuf) -> Result<Response<Body>, Infallible> {
+    match fs::read_dir(path) {
+        Ok(entries) => {
+            let mut response_body = String::new();
+
+            for entry in entries.filter_map(Result::ok) {
+                let file_name = entry.file_name().to_string_lossy().into_owned();
+                response_body.push_str(&file_name);
+                response_body.push('\n');
+            }
+
+            let response = Response::builder()
+                .status(StatusCode::OK)
+                .header("Content-Type", "text/plain")
+                .body(Body::from(response_body))
+                .unwrap();
+
+            Ok(response)
+        }
+        Err(err) => {
+            if err.kind() == std::io::ErrorKind::NotFound {
+                let response = Response::builder()
+                    .status(StatusCode::NOT_FOUND)
+                    .body(Body::from("Not Found"))
+                    .unwrap();
+
+                Ok(response)
+            } else {
+                eprintln!("Failed to read directory: {}", err);
+                let response = Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .body(Body::from("Internal Server Error"))
+                    .unwrap();
+
+                Ok(response)
+            }
+        }
+    }
+}
+
 async fn handle(req: Request<Body>, base_path: PathBuf) -> Result<Response<Body>, Infallible> {
     let path = req.uri().path();
-    let mut file_path = base_path.clone();
+    let mut file_path = base_path;
 
     for part in path.split('/').skip(1) {
         // skip the first empty part
         file_path.push(part);
+    }
+
+    // If path is a directory, try to serve index.html file
+    if file_path.is_dir() {
+        let mut index_path = file_path.clone();
+        index_path.push("index.html");
+        if index_path.exists() {
+            file_path = index_path;
+        } else {
+            // If no index.html, generate a directory listing
+            return generate_directory_listing(file_path).await;
+        }
     }
 
     let mime_type = mime_guess::from_path(&file_path).first_or_octet_stream();
